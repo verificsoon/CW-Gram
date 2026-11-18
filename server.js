@@ -72,14 +72,8 @@ function uid() {
   return crypto.randomUUID();
 }
 
-function initDB() {
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-      if (parsed && parsed.users) return parsed;
-    } catch {}
-  }
 
+function createInitialDB() {
   const ownerPass = hashSecret(process.env.OWNER_PASS || '2016');
   const ownerCloud = hashSecret(process.env.OWNER_CLOUD_PASS || '2016');
   const ownerId = 'u_owner';
@@ -137,21 +131,91 @@ function initDB() {
     adminAudit: []
   };
 
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
   return db;
 }
 
-let db = initDB();
-let savePending = false;
+const { Pool } = require('pg');
+
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL не задана в Environment');
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 15000
+});
+
+let db;
+let saveQueue = Promise.resolve();
+
+async function initDB() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS cwgram_state (
+      id SMALLINT PRIMARY KEY,
+      payload JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  const result = await pool.query(
+    'SELECT payload FROM cwgram_state WHERE id = 1'
+  );
+
+  if (result.rows.length) {
+    db = result.rows[0].payload;
+    if (typeof db === 'string') db = JSON.parse(db);
+    console.log('Данные CW-Gram загружены из Neon');
+  } else {
+    let localData = null;
+
+    if (fs.existsSync(DB_FILE)) {
+      try {
+        localData = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+      } catch (err) {
+        console.error('Не удалось прочитать локальную БД:', err.message);
+      }
+    }
+
+    db = localData && localData.users
+      ? localData
+      : createInitialDB();
+
+    await pool.query(
+      `INSERT INTO cwgram_state (id, payload)
+       VALUES (1, $1::jsonb)`,
+      [JSON.stringify(db)]
+    );
+
+    console.log('Начальные данные сохранены в Neon');
+  }
+
+  if (!db || !db.users || !db.sessions || !db.chats) {
+    throw new Error('Структура базы данных некорректна');
+  }
+}
+
 function saveDB() {
-  if (savePending) return;
-  savePending = true;
-  setImmediate(() => {
-    savePending = false;
-    const tmp = DB_FILE + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
-    fs.renameSync(tmp, DB_FILE);
-  });
+  if (!db) return saveQueue;
+
+  const snapshot = JSON.stringify(db);
+
+  saveQueue = saveQueue
+    .then(() => pool.query(
+      `INSERT INTO cwgram_state (id, payload, updated_at)
+       VALUES (1, $1::jsonb, NOW())
+       ON CONFLICT (id) DO UPDATE
+       SET payload = EXCLUDED.payload,
+           updated_at = NOW()`,
+      [snapshot]
+    ))
+    .catch(err => {
+      console.error('Ошибка сохранения Neon:', err.message);
+    });
+
+  return saveQueue;
 }
 
 // ==================== СЕРВЕР И WEBSOCKET ====================
@@ -899,4 +963,14 @@ app.post('/api/admin/broadcast', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true });
 });
 
-server.listen(PORT, () => console.log(`CW-Gram server running on http://localhost:${PORT}`));
+
+initDB()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log('CW-Gram server running on port ' + PORT);
+    });
+  })
+  .catch(err => {
+    console.error('Ошибка запуска CW-Gram:', err);
+    process.exit(1);
+  });
