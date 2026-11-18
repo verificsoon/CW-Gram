@@ -1,0 +1,9 @@
+{
+  "appId": "com.cowin.gram",
+  "appName": "CW-Gram",
+  "webDir": "public",
+  "server": {
+    "url": "https://cw-gram.onrender.com",
+    "cleartext": false
+  }
+}
